@@ -45,15 +45,17 @@ static int oc20_lba_str(char *buf, FemuCtrl *n, NvmeNamespace *ns, uint64_t lba)
 }
 #endif
 
+#define DEBUG_OC20
+
 #ifdef DEBUG_OC20
 static void pr_lba(Oc20Namespace *lns, uint64_t lba)
 {
     Oc20AddrF *addrf = &lns->lbaf;
 
-    uint64_t grp = OC20_LBA_GET_SECTR(addrf, lba);
-    uint64_t lun = OC20_LBA_GET_CHUNK(addrf, lba);
-    uint64_t chk = OC20_LBA_GET_PUNIT(addrf, lba);
-    uint64_t sec = OC20_LBA_GET_GROUP(addrf, lba);
+    uint64_t grp = OC20_LBA_GET_GROUP(addrf, lba);
+    uint64_t lun = OC20_LBA_GET_PUNIT(addrf, lba);
+    uint64_t chk = OC20_LBA_GET_CHUNK(addrf, lba);
+    uint64_t sec = OC20_LBA_GET_SECTR(addrf, lba);
 
     femu_log("LBA(0x%lx): ch(%lu), lun(%lu), blk(%lu), sec(%lu)\n", lba, grp,
              lun, chk, sec);
@@ -751,6 +753,7 @@ static uint16_t oc20_rw(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req, bool vector
     uint64_t aio_sector_list[OC20_CMD_MAX_LBAS];
     for (i = 0; i < nlb; i++) {
 #ifdef DEBUG_OC20
+        Oc20Namespace *lns = (Oc20Namespace *) ns->state;
         pr_lba(lns, ((uint64_t *)req->slba)[i]);
 #endif
         aio_sector_list[i] = (((uint64_t *)req->slba)[i] << lbads);
