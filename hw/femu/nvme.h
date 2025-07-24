@@ -346,6 +346,14 @@ enum NvmeIoCommands {
     NVME_CMD_OC_READ            = 0x92,
 };
 
+enum CsdIoCommands {
+    CSD_CMD_TEST                = 0xCC,
+    CSD_CMD_Filter              = 0xC0,
+    CSD_CMD_Checksum            = 0xC1,
+    CSD_CMD_RESET               = 0xC2,
+    CSD_CMD_REPORT              = 0xC3,
+};
+
 typedef struct NvmeDeleteQ {
     uint8_t     opcode;
     uint8_t     flags;
@@ -1510,6 +1518,16 @@ static inline uint16_t nvme_check_mdts(FemuCtrl *n, size_t len)
 
 #define MN_MAX_LEN (64)
 #define ID_MAX_LEN (4)
+
+// ADD CSD FUCTION AND TEST LOG
+#define FEMU_DEBUG_CSD
+#ifdef FEMU_DEBUG_CSD
+#define CSD_debug(fmt, ...) \
+    do { printf("" fmt, ## __VA_ARGS__); } while (0)
+#else
+#define CSD_debug(fmt, ...) \
+    do { } while (0)
+#endif
 
 //#define FEMU_DEBUG_NVME
 #ifdef FEMU_DEBUG_NVME

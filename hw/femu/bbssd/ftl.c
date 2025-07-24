@@ -236,7 +236,7 @@ static void check_params(struct ssdparams *spp)
 
 static void ssd_init_params(struct ssdparams *spp, FemuCtrl *n)
 {
-    ftl_log("[YS_log_ssd_init_params]: ssd_init_params\n");
+    CSD_debug("[YS_ssd_init_params]: ssd_init_params\n");
     spp->secsz = n->bb_params.secsz; // 512
     spp->secs_per_pg = n->bb_params.secs_per_pg; // 8
     spp->pgs_per_blk = n->bb_params.pgs_per_blk; //256
@@ -783,11 +783,11 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
     }
 
-    //ftl_log("[YS_log_ssd_read]: ssd_read start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
-    //ftl_log("[YS_log_ssd_read]: spp->pg_rd_lat = %d\n", spp->pg_rd_lat);
-    //ftl_log("[YS_log_ssd_read]: spp->pg_wr_lat = %d\n", spp->pg_wr_lat);
-    //ftl_log("[YS_log_ssd_read]: spp->blk_er_lat = %d\n", spp->blk_er_lat);
-    //ftl_log("[YS_log_ssd_read]:%s,lpn(%" PRId64 ") mapped to ppa\n", ssd->ssdname, lpn);
+    //CSD_debug("[YS_ssd_read]: ssd_read start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
+    //CSD_debug("[YS_ssd_read]: spp->pg_rd_lat = %d\n", spp->pg_rd_lat);
+    //CSD_debug("[YS_ssd_read]: spp->pg_wr_lat = %d\n", spp->pg_wr_lat);
+    //CSD_debug("[YS_ssd_read]: spp->blk_er_lat = %d\n", spp->blk_er_lat);
+    //CSD_debug("[YS_ssd_read]:%s,lpn(%" PRId64 ") mapped to ppa\n", ssd->ssdname, lpn);
 
     /* normal IO read path */
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
@@ -806,8 +806,9 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         sublat = ssd_advance_status(ssd, &ppa, &srd);
         maxlat = (sublat > maxlat) ? sublat : maxlat;
 
-        ftl_log("[YS_log_ssd_read]:The ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d,sec:%d\n\n",
+        /*CSD_debug("[YS_ssd_read]:The ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d,sec:%d\n\n",
             ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pl, ppa.g.pg, ppa.g.sec);
+            */
     }
 
     return maxlat;
@@ -835,6 +836,10 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         if (r == -1)
             break;
     }
+
+
+    //CSD_debug(" [YS_ssd_write]: start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
+    //CSD_debug(" [YS_ssd_write]: end_lpn=%"PRIu64",tt_pgs=%d\n", end_lpn, ssd->sp.tt_pgs);
 
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
         ppa = get_maptbl_ent(ssd, lpn);
@@ -864,8 +869,8 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         curlat = ssd_advance_status(ssd, &ppa, &swr);
         maxlat = (curlat > maxlat) ? curlat : maxlat;
 
-        ftl_log(" [YS_log_ssd_write]: The ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d,sec:%d\n\n",
-            ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pl, ppa.g.pg, ppa.g.sec);
+        //CSD_debug(" [YS_ssd_write]: The ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d,sec:%d\n\n",
+        //    ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pl, ppa.g.pg, ppa.g.sec);
     }
 
     return maxlat;
@@ -901,6 +906,7 @@ static void *ftl_thread(void *arg)
             ftl_assert(req);
             switch (req->cmd.opcode) {
             case NVME_CMD_WRITE:
+                
                 lat = ssd_write(ssd, req);
                 break;
             case NVME_CMD_READ:

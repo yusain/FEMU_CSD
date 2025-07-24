@@ -1,0 +1,8 @@
+{
+    "files.associations": {
+        "*.code": "c",
+        "*.inc": "c",
+        "*.idef": "c",
+        "*.def": "c"
+    }
+}
