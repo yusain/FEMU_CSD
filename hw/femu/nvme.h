@@ -350,8 +350,9 @@ enum CsdIoCommands {
     CSD_CMD_TEST                = 0xCC,
     CSD_CMD_Filter              = 0xC0,
     CSD_CMD_Checksum            = 0xC1,
-    CSD_CMD_RESET               = 0xC2,
-    CSD_CMD_REPORT              = 0xC3,
+    CSD_CMD_BMP_BIN             = 0xC2, //Bitmap Binarization
+    CSD_CMD_RESET               = 0xCE,
+    CSD_CMD_REPORT              = 0xCF,
 };
 
 typedef struct NvmeDeleteQ {

@@ -311,6 +311,133 @@ static uint16_t CSD_Checksum(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     return NVME_SUCCESS;
 }
 
+// device — 逐像素黑白二值（B=G=R=0/255），每段回傳處理後總和(DW0)
+static uint16_t CSD_BMP_BIN(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
+{
+    NvmeRwCmd *rw = (NvmeRwCmd *)cmd;
+    const uint16_t ctrl = le16_to_cpu(rw->control);
+    const uint32_t nlb  = le16_to_cpu(rw->nlb) + 1;
+    const uint64_t slba = le64_to_cpu(rw->slba);
+    const uint64_t prp1 = le64_to_cpu(rw->prp1);
+    const uint64_t prp2 = le64_to_cpu(rw->prp2);
+
+    const uint8_t  lba_index  = NVME_ID_NS_FLBAS_INDEX(ns->id_ns.flbas);
+    const uint8_t  data_shift = ns->id_ns.lbaf[lba_index].lbads;
+    const uint64_t data_size  = (uint64_t)nlb << data_shift;
+    const uint64_t data_offset= ((uint64_t)le64_to_cpu(rw->slba)) << data_shift;
+
+    uint16_t err = femu_nvme_rw_check_req(n, ns, cmd, req, slba, slba + nlb, nlb, ctrl, data_size, 0);
+    if (err) {
+        return err;
+    }
+    if (nvme_map_prp(&req->qsg, &req->iov, prp1, prp2, data_size, n)) {
+        nvme_set_error_page(n, req->sq->sqid, cmd->cid, NVME_INVALID_FIELD,
+                            offsetof(NvmeRwCmd, prp1), 0, ns->id);
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    /* ---- 主機參數 ---- */
+    const uint32_t width    = le32_to_cpu(cmd->cdw13);
+    const uint32_t abs_h    = le32_to_cpu(cmd->cdw14);
+    const uint32_t cdw15    = le32_to_cpu(cmd->cdw15);
+    const uint32_t bpp      = (cdw15 >> 24) & 0xFF;           /* 24 */
+    const uint32_t stride   = (cdw15 & 0x00FFFFFF);           /* 0 = auto(4-byte aligned) */
+    const uint32_t cdw12    = le32_to_cpu(cmd->cdw12);
+    const uint8_t  thr      = (cdw12 >> 16) & 0xFF;           /* 門檻(0..255) */
+
+    const uint64_t row_bytes= (uint64_t)width * 3u;
+    const uint64_t stride_ex= (stride == 0) ? ((row_bytes + 3) & ~3ULL) : stride;
+
+    if (bpp != 24 || width == 0 || abs_h == 0 || stride_ex < row_bytes) {
+        CSD_debug("[CSD_BMP_BIN] bad params w=%u h=%u bpp=%u row=%llu stride=%llu\n",
+                  (unsigned)width, (unsigned)abs_h, (unsigned)bpp,
+                  (unsigned long long)row_bytes, (unsigned long long)stride_ex);
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    /* 命令摘要（一次）*/
+    CSD_debug("[CSD_BMP_BIN][CMD] slba=%llu nlb=%u bytes=%llu | w=%u h=%u row=%llu stride=%llu thr=%u\n",
+              (unsigned long long)slba, (unsigned)nlb, (unsigned long long)data_size,
+              (unsigned)width, (unsigned)abs_h,
+              (unsigned long long)row_bytes, (unsigned long long)stride_ex, (unsigned)thr);
+
+    /* 逐 SG；維持列位置與像素內狀態（跨 SG 對齊） */
+    int sg_idx = 0;
+    dma_addr_t sg_byte = 0;
+    uint64_t mb_oft = data_offset;
+    uint8_t *mb = (uint8_t *)n->mbe->logical_space;
+    QEMUSGList *qsg = &req->qsg;
+
+    uint64_t row_pos = 0;            /* 0..stride_ex-1（row_bytes 內為像素資料，後面是 padding） */
+    uint16_t sum3 = 0;               /* 累積 B+G+R（最多 765） */
+    uint8_t  ch   = 0;               /* 目前像素通道索引 0..2 */
+    const uint16_t thr3 = (uint16_t)thr * 3u;
+
+    /* 這個 request（也就是「這一段」）的處理後總和 */
+    uint64_t dev_sum64 = 0;
+
+    while (sg_idx < qsg->nsg) {
+        dma_addr_t cur_addr = qsg->sg[sg_idx].base + sg_byte;
+        dma_addr_t cur_len  = qsg->sg[sg_idx].len  - sg_byte;
+        uint8_t *buf        = mb + mb_oft;
+
+        dma_memory_read(qsg->as, cur_addr, buf, cur_len, MEMTXATTRS_UNSPECIFIED);
+
+        /* 輕量 debug：每 64 個 SG 印一次 */
+        if ((sg_idx % 64) == 0) {
+            CSD_debug("[CSD_BMP_BIN][SG%u] len=%llu row_pos=%llu\n",
+                      (unsigned)sg_idx,
+                      (unsigned long long)cur_len,
+                      (unsigned long long)row_pos);
+        }
+
+        /* 先做二值化（跨 SG 維持 ch/sum3；遇到 stride 邊界清零） */
+        for (uint64_t i = 0; i < (uint64_t)cur_len; i++) {
+            if (row_pos < row_bytes) {
+                sum3 += buf[i];
+                ch++;
+                if (ch == 3) {
+                    uint8_t v = (sum3 >= thr3) ? 255 : 0;  /* 黑白二值 */
+                    buf[i - 2] = v;  /* B */
+                    buf[i - 1] = v;  /* G */
+                    buf[i]     = v;  /* R */
+                    sum3 = 0;
+                    ch   = 0;
+                }
+            }
+            row_pos++;
+            if (row_pos == stride_ex) { /* 換行：重置像素內狀態 */
+                row_pos = 0;
+                sum3 = 0;
+                ch   = 0;
+            }
+        }
+
+        /* 就在 buf 內完成後，再把這個 SG 的 bytes 做總和（處理後狀態） */
+        uint32_t seg_sum = 0;
+        for (uint64_t i = 0; i < (uint64_t)cur_len; i++) {
+            seg_sum += buf[i];
+        }
+        dev_sum64 += seg_sum;
+
+        /* 寫回來賓實體記憶體 */
+        dma_memory_write(qsg->as, cur_addr, buf, cur_len, MEMTXATTRS_UNSPECIFIED);
+
+        /* 下一個 SG */
+        sg_byte += cur_len;
+        if (sg_byte == qsg->sg[sg_idx].len) {
+            sg_byte = 0;
+            ++sg_idx;
+        }
+        mb_oft += cur_len;
+    }
+
+    /* 把本段的處理後總和（32-bit）回傳到 DW0，供主機端比對 */
+    req->cqe.n.result = cpu_to_le32((uint32_t)(dev_sum64 & 0xFFFFFFFFu));
+    return NVME_SUCCESS;
+}
+
+
 
 static uint16_t bb_io_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
                           NvmeRequest *req)
@@ -328,6 +455,10 @@ static uint16_t bb_io_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     case CSD_CMD_Checksum:
         CSD_Checksum(n, ns, cmd, req);
         return NVME_SUCCESS;
+    case CSD_CMD_BMP_BIN:
+        CSD_BMP_BIN(n, ns, cmd, req);
+        return NVME_SUCCESS;
+
     case CSD_CMD_RESET:
         // 重設統計
         //CSD_debug("\rCSD_CMD_RESET\n");
