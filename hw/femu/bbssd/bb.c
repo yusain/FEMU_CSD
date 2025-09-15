@@ -80,32 +80,52 @@ static uint16_t bb_nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
 static uint64_t csd_total_time_us = 0;
 static uint64_t csd_total_calls   = 0;
 static uint64_t csd_total_bytes   = 0;
-static uint64_t csd_filtered_bytes= 0; // 非 ASCII printable bytes
 
+// ---- 最終版 CSD_Filter ----
+// mode=1: Bit-count  -> 回傳 '1' 的數量（不改 buffer）
+// mode=2: ASCII      -> 只保留可見 ASCII，縮短；寫回 PRP 起點，DW0=輸出長度
+// mode=3: DNA(FASTA) -> 只保留 A/C/G/T，移除 header 與所有非 A/C/G/T（含空白、數字、N…）；
+//                       不插入換行，寫回 PRP 起點，DW0=輸出長度
 
+// helper：把 src[0..len) 寫回 PRP (qsg) 起點，連續覆蓋
+static void qsg_write_from_buf(QEMUSGList *qsg, const uint8_t *src, uint64_t len)
+{
+    int sg_idx = 0; dma_addr_t sg_off = 0; uint64_t off = 0;
+    while (sg_idx < qsg->nsg && off < len) {
+        dma_addr_t cur = qsg->sg[sg_idx].base + sg_off;
+        uint64_t avail = qsg->sg[sg_idx].len - sg_off;
+        uint64_t n = MIN(avail, len - off);
+        dma_memory_write(qsg->as, cur, (void*)(src + off), n, MEMTXATTRS_UNSPECIFIED);
+        off += n; sg_off += n;
+        if (sg_off == qsg->sg[sg_idx].len) { sg_off = 0; ++sg_idx; }
+    }
+}
+
+// ---- CSD_Filter ----
 static uint16_t CSD_Filter(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
                            NvmeRequest *req)
 {
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start); // 開始計時
+    struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    // nvme-io.c->nvme_rw
-    NvmeRwCmd *rw = (NvmeRwCmd *)cmd;
+    NvmeRwCmd *rw = (NvmeRwCmd*)cmd;
     uint16_t ctrl = le16_to_cpu(rw->control);
     uint32_t nlb  = le16_to_cpu(rw->nlb) + 1;
     uint64_t slba = le64_to_cpu(rw->slba);
     uint64_t prp1 = le64_to_cpu(rw->prp1);
     uint64_t prp2 = le64_to_cpu(rw->prp2);
 
-    const uint8_t lba_index = NVME_ID_NS_FLBAS_INDEX(ns->id_ns.flbas);
-    const uint16_t ms = le16_to_cpu(ns->id_ns.lbaf[lba_index].ms);
-    const uint8_t data_shift = ns->id_ns.lbaf[lba_index].lbads;
-    uint64_t data_size = (uint64_t)nlb << data_shift;
-    uint64_t data_offset = slba << data_shift;
-    uint64_t meta_size = nlb * ms;
-    uint64_t elba = slba + nlb;
-    uint16_t err;
+    const uint8_t  lba_idx   = NVME_ID_NS_FLBAS_INDEX(ns->id_ns.flbas);
+    const uint8_t  lbads     = ns->id_ns.lbaf[lba_idx].lbads;
+    const uint16_t ms        = le16_to_cpu(ns->id_ns.lbaf[lba_idx].ms);
+    const uint64_t data_size = (uint64_t)nlb << lbads;
+    const uint64_t meta_size = (uint64_t)nlb * ms;
+    const uint64_t elba      = slba + nlb;
 
+    const uint8_t  mode      = (uint8_t)(cmd->cdw15 & 0xFF);
+    uint64_t       valid_len = (uint64_t)le32_to_cpu(cmd->cdw10);
+    if (!valid_len || valid_len > data_size) valid_len = data_size;
+
+    uint16_t err;
     if (femu_nvme_rw_check_req(n, ns, cmd, req, slba, elba, nlb, ctrl, data_size, meta_size))
         return err;
 
@@ -115,92 +135,93 @@ static uint16_t CSD_Filter(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         return NVME_INVALID_FIELD | NVME_DNR;
     }
 
-    assert((nlb << data_shift) == req->qsg.size);
+    req->slba = slba; req->status = NVME_SUCCESS; req->nlb = nlb;
 
-    req->slba = slba;
-    req->status = NVME_SUCCESS;
-    req->nlb = nlb;
-
-    /*CSD_debug("[YS_CSD_Filter]: cmd->opcode = %x, slba = %lu, nlb = %u, prp1 = 0x%016lx, prp2 = 0x%016lx\n",
-        rw->opcode, slba, nlb, le64_to_cpu(rw->prp1), le64_to_cpu(rw->prp2)); */
-
-    // dram.c->backend_rw
-    int sg_cur_index = 0;
-    dma_addr_t sg_cur_byte = 0;
-    uint64_t mb_oft = data_offset;
-    dma_addr_t cur_addr, cur_len;
-    void *mb = n->mbe->logical_space;
+    int sg_idx = 0; dma_addr_t sg_off = 0;
+    uint8_t *mb = (uint8_t*)n->mbe->logical_space;
+    uint64_t mb_ofs = slba << lbads;
     QEMUSGList *qsg = &req->qsg;
-    
-    uint64_t filtered_cnt = 0;
 
-    //CSD_debug("qsg->nsg = %d, qsg->size = %lu, data_size = %lu\n", qsg->nsg, qsg->size, data_size);
-    while (sg_cur_index < qsg->nsg) {
-        cur_addr = qsg->sg[sg_cur_index].base + sg_cur_byte;
-        cur_len = qsg->sg[sg_cur_index].len - sg_cur_byte;
+    uint64_t done = 0;
+    uint64_t result = 0;
 
-        unsigned char *data = (unsigned char *)(mb + mb_oft);
-        
-        /*CSD_debug("sg_cur_index=%d, cur_addr=0x%lx, cur_len=%lu, mb_oft=%lu\n",
-                                     sg_cur_index, cur_addr, cur_len, mb_oft);*/
-
-        // 將主機 buffer 資料 DMA 讀入設備 buffer
-        dma_memory_read(qsg->as, cur_addr, data, cur_len, MEMTXATTRS_UNSPECIFIED);
-        
-        // 準備過濾後 buffer
-        unsigned char *filtered_buf = malloc(cur_len);
-        if (!filtered_buf) {
-            CSD_debug("filtered_buf malloc failed\n");
-            return 1;
-        }
-
-        /*/ 印出原始資料 (hex)
-        CSD_debug("[YS_CSD_Filter] 印出前 64 bytes (Hex):\n");
-        for (size_t i = 0; i < 64; ++i) {
-            CSD_debug("%02X%c", data[i], (i + 1) % 16 ? ' ' : '\n');
-        }*/
-        
-        //CSD_debug("[YS_CSD_Filter] 過濾後前 64 bytes區塊結果 (ASIIC):\n");
-        for (uint64_t i = 0; i < cur_len; i++) {
-            if (data[i] >= 32 && data[i] <= 126) {
-                filtered_buf[i] = data[i];
-                filtered_cnt++;
-            } else {
-                filtered_buf[i] = '*';
-            }
-            //if (i < 64) CSD_debug("%c%c", filtered_buf[i], (i + 1) % 16 ? ' ' : '\n');
-        }
-        //CSD_debug("\n");
-
-        // 將過濾後資料寫回主機 buffer
-        dma_memory_write(qsg->as, cur_addr, filtered_buf, cur_len, MEMTXATTRS_UNSPECIFIED);
-
-        free(filtered_buf);
-
-        sg_cur_byte += cur_len;
-        if (sg_cur_byte == qsg->sg[sg_cur_index].len) {
-            sg_cur_byte = 0;
-            ++sg_cur_index;
-        }
-        mb_oft += cur_len;
+    // DNA/ASCII 「縮短」需要一次累積再回寫
+    uint8_t *out_all = NULL; uint64_t out_len = 0;
+    if (mode == 2 || mode == 3) {
+        out_all = g_malloc(valid_len);             // 上限即原長
+        if (!out_all) return NVME_INTERNAL_DEV_ERROR;
     }
 
-    // 結束計時
-    clock_gettime(CLOCK_MONOTONIC, &end); 
-    long diff_us = (end.tv_sec - start.tv_sec) * 1000000L +
-                (end.tv_nsec - start.tv_nsec) / 1000L;
+    // DNA：行首/標頭狀態（host 仍以「行對齊」打包，本狀態只在單次命令內使用）
+    bool at_line_start = true, in_header = false;
 
-    // 更新統計變數
-    csd_total_time_us    += diff_us;
-    csd_total_calls      += 1;
-    csd_total_bytes      += data_size;
-    csd_filtered_bytes   += filtered_cnt;
+    while (sg_idx < qsg->nsg && done < valid_len) {
+        dma_addr_t cur = qsg->sg[sg_idx].base + sg_off;
+        uint64_t avail = qsg->sg[sg_idx].len - sg_off;
+        uint64_t take  = MIN(avail, valid_len - done);
 
-    // 輸出單次執行資訊
-    CSD_debug("[YS_CSD_Filter] time: %ld us | size: %lu B | filtered: %lu B (%.2f%%)\n",
-            diff_us, data_size, filtered_cnt, data_size ? (100.0 * filtered_cnt / data_size) : 0.0);
+        uint8_t *buf = mb + mb_ofs;
+        dma_memory_read(qsg->as, cur, buf, take, MEMTXATTRS_UNSPECIFIED);
 
-    return 0;
+        if (mode == 1) {
+            // Bit-count：只計數
+            for (uint64_t i=0;i<take;i++){
+                uint8_t c = buf[i];
+                result += (c=='0' || c=='1' || c==' ' || c=='\n' || c=='\r')
+                          ? (c=='1')
+                          : __builtin_popcount(c);      // 相容位元流
+            }
+
+        } else if (mode == 2) {
+            // ASCII-shrink：只保留可見 ASCII(32..126)
+            for (uint64_t i=0;i<take;i++){
+                uint8_t c = buf[i];
+                if (c >= 32 && c <= 126) out_all[out_len++] = c;
+            }
+
+        } else if (mode == 3) {
+            // DNA-strip：移除 header；只保留 A/C/G/T；不輸出換行
+            for (uint64_t i=0;i<take;i++){
+                uint8_t c = buf[i];
+                if (c == '\r') continue;
+                if (c == '\n') { at_line_start = true; in_header = false; continue; }
+                if (at_line_start) {
+                    at_line_start = false;
+                    if (c == '>') { in_header = true; continue; }  // 整行略過
+                }
+                if (in_header) continue;
+
+                // 保留 A/C/G/T（大小寫皆可；不改大小寫）
+                if (c=='A'||c=='C'||c=='G'||c=='T'||
+                    c=='a'||c=='c'||c=='g'||c=='t') {
+                    out_all[out_len++] = c;
+                }
+            }
+        }
+
+        done   += take;
+        sg_off += take;
+        if (sg_off == qsg->sg[sg_idx].len) { sg_off = 0; ++sg_idx; }
+        mb_ofs += take;
+    }
+
+    if (mode == 2 || mode == 3) {
+        qsg_write_from_buf(qsg, out_all, out_len);   // 覆蓋回 PRP 起點
+        result = out_len;
+        g_free(out_all);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long us = (t1.tv_sec - t0.tv_sec)*1000000L + (t1.tv_nsec - t0.tv_nsec)/1000L;
+
+    csd_total_time_us  += us;
+    csd_total_calls    += 1;
+    csd_total_bytes    += valid_len;
+
+    req->cqe.n.result = cpu_to_le32((uint32_t)result);
+    CSD_debug("[CSD_Filter] mode=%u | in_valid=%lu | out=%lu | %ld us\n",
+              mode, valid_len, result, us);
+    return NVME_SUCCESS;
 }
 
 
@@ -243,10 +264,10 @@ static uint16_t CSD_Checksum(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     req->status = NVME_SUCCESS;
     req->nlb = nlb;
 
-    /*CSD_debug("[YS_CSD_Checksum]: cmd->opcode = %x, slba = %lu, nlb = %u, prp1 = 0x%016lx, prp2 = 0x%016lx\n",
-        rw->opcode, slba, nlb, prp1, prp2);*/
+    /*CSD_debug("[YS_CSD_Filter]: cmd->opcode = %x, slba = %lu, nlb = %u, prp1 = 0x%016lx, prp2 = 0x%016lx\n",
+    rw->opcode, slba, nlb, le64_to_cpu(rw->prp1), le64_to_cpu(rw->prp2)); */
 
-    // dma buffer 讀取與 hash 計算
+    // 準備計算 SHA-256
     int sg_cur_index = 0;
     dma_addr_t sg_cur_byte = 0;
     uint64_t mb_oft = data_offset;
@@ -257,24 +278,14 @@ static uint16_t CSD_Checksum(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     tiny_sha256_ctx sha256;
     tiny_sha256_init(&sha256);
 
-    //CSD_debug("qsg->nsg = %d, qsg->size = %lu, data_size = %lu\n", qsg->nsg, qsg->size, data_size);
-
     while (sg_cur_index < qsg->nsg) {
         cur_addr = qsg->sg[sg_cur_index].base + sg_cur_byte;
         cur_len = qsg->sg[sg_cur_index].len - sg_cur_byte;
 
         unsigned char *data = (unsigned char *)(mb + mb_oft);
 
-        /*CSD_debug("sg_cur_index=%d, cur_addr=0x%lx, cur_len=%lu, mb_oft=%lu\n",
-                  sg_cur_index, cur_addr, cur_len, mb_oft);*/
         // DMA 讀入
         dma_memory_read(qsg->as, cur_addr, data, cur_len, MEMTXATTRS_UNSPECIFIED);
-
-        /*/ 印出原始資料 (hex)
-        CSD_debug("印出前 64 bytes (Hex):\n");
-        for (size_t i = 0; i < 64; ++i) {
-            CSD_debug("%02X%c", data[i], (i + 1) % 16 ? ' ' : '\n');
-        }*/
 
         // 累積進 SHA-256
         tiny_sha256_update(&sha256, data, cur_len);
@@ -290,12 +301,10 @@ static uint16_t CSD_Checksum(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     unsigned char hash[SHA256_DIGEST_LENGTH];
     tiny_sha256_final(&sha256, hash);
 
-    /*/ 印出 SHA-256 hash 結果
-    CSD_debug("\n[YS_CSD_Checksum]: SHA-256 = ");
-    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
-        CSD_debug("%02x", hash[i]);
-    }
-    CSD_debug("\n");*/
+    // 將 SHA256 hash 前 4 bytes 存到 result 供 host 驗證
+    uint32_t hash32;
+    memcpy(&hash32, hash, sizeof(uint32_t));
+    req->cqe.n.result = hash32;
 
     clock_gettime(CLOCK_MONOTONIC, &end);
     long diff_us = (end.tv_sec - start.tv_sec) * 1000000L +
@@ -306,10 +315,12 @@ static uint16_t CSD_Checksum(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     csd_total_calls += 1;
     csd_total_bytes += data_size;
 
-    CSD_debug("[YS_CSD_Checksum] time: %ld us | size: %lu B\n", diff_us, data_size);
+    /*CSD_debug("[YS_CSD_Checksum] time: %ld us | size: %lu B | result=0x%08x\n",
+              diff_us, data_size, hash32);*/
 
     return NVME_SUCCESS;
 }
+
 
 // device — 逐像素黑白二值（B=G=R=0/255），每段回傳處理後總和(DW0)
 static uint16_t CSD_BMP_BIN(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
@@ -465,22 +476,17 @@ static uint16_t bb_io_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         csd_total_time_us = 0;
         csd_total_calls = 0;
         csd_total_bytes = 0;
-        csd_filtered_bytes = 0;
         return NVME_SUCCESS;
     case CSD_CMD_REPORT:
         // 輸出統計資訊
         //CSD_debug("\rCSD_CMD_REPORT\n");
         double avg_us = (double)csd_total_time_us / csd_total_calls;
-        double bw_mb_s = (double)csd_total_bytes / csd_total_time_us; // MB/s ≈ bytes/us
-        double filter_pct = csd_total_bytes ? (100.0 * csd_filtered_bytes / csd_total_bytes) : 0.0;
 
         femu_log("=== CSD Summary ===\n");
         femu_log("  Total Ops      : %lu\n", csd_total_calls);
         femu_log("  Total Bytes    : %lu\n", csd_total_bytes);
         femu_log("  Total Time     : %lu us\n", csd_total_time_us);
         femu_log("  Avg Time/op    : %.2f us\n", avg_us);
-        femu_log("  Avg BW         : %.2f MB/s\n", bw_mb_s);
-        femu_log("  Filtered Bytes : %lu (%.2f%%)\n", csd_filtered_bytes, filter_pct);
         return NVME_SUCCESS;
 
     default:

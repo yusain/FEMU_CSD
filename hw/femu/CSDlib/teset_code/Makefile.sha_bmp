@@ -1,0 +1,40 @@
+# teset_code/Makefile
+# run with `make -f Makefile.sha_bmp` or `make -f Makefile.sha_bmp all`
+CC      := gcc
+CFLAGS  := -O2 -Wall -Wextra -Wshadow
+OUTDIR  := EXE
+LDLIBS  :=
+
+# --- OpenSSL 探測（for checksum_test.exe） ---
+OPENSSL_CFLAGS := $(shell pkg-config --cflags openssl 2>/dev/null)
+OPENSSL_LIBS   := $(shell pkg-config --libs   openssl 2>/dev/null)
+# 若系統沒有 pkg-config 或沒有 openssl.pc，退回只連 libcrypto
+ifeq ($(strip $(OPENSSL_LIBS)),)
+  OPENSSL_LIBS := -lcrypto
+endif
+
+# 要產出的三個執行檔
+PROGS := $(OUTDIR)/bmp_BIN.exe \
+         $(OUTDIR)/checksum_test.exe \
+         $(OUTDIR)/filter.exe
+
+.PHONY: all clean
+all: $(PROGS)
+
+# 只確保目錄存在（不參與更新判斷）
+$(OUTDIR):
+	@mkdir -p $@
+
+# 一對一規則（名稱不完全對應，所以明確寫出）
+$(OUTDIR)/bmp_BIN.exe: bmp_BIN_test.c | $(OUTDIR)
+	$(CC) $(CFLAGS) $< -o $@ $(LDLIBS)
+
+# checksum_test.exe 需要 OpenSSL
+$(OUTDIR)/checksum_test.exe: checksum_test.c | $(OUTDIR)
+	$(CC) $(CFLAGS) $(OPENSSL_CFLAGS) $< -o $@ $(LDLIBS) $(OPENSSL_LIBS)
+
+$(OUTDIR)/filter.exe: filter_test.c | $(OUTDIR)
+	$(CC) $(CFLAGS) $< -o $@ $(LDLIBS)
+
+clean:
+	rm -rf $(OUTDIR)

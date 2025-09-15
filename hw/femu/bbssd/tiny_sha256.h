@@ -9,7 +9,7 @@
 typedef struct {
     uint32_t state[8];
     uint64_t bitcount;      // 累積 bit 數
-    size_t buffer_len;      // 累積 buffer bytes (for padding)
+    size_t  buffer_len;     // 累積 buffer bytes (for padding)
     uint8_t buffer[64];     // block buffer
 } tiny_sha256_ctx;
 
